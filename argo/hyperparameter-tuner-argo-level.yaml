@@ -1,0 +1,268 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: hyperparameter-tuning-optuna
+spec:
+  serviceAccountName: argo
+  entrypoint: hyperparameter-tuning
+  volumes:
+    - name: workdir
+      emptyDir: {}
+  templates:
+    - name: hyperparameter-tuning
+      inputs:
+        parameters:
+          - name: num-parallel-runs
+            value: 5
+          - name: duration-mins
+            value: "2.5"
+      steps:
+        - - name: create-postgres
+            template: create-postgres
+
+          - name: download-training-data
+            template: download-training-data
+
+          - name: generate-pod-list
+            template: generate-pod-list
+            arguments:
+              parameters:
+                - name: num-parallel-runs
+                  value: "{{inputs.parameters.num-parallel-runs}}"
+
+        - - name: create-study-optuna
+            template: create-study-optuna
+            arguments:
+              parameters:
+                - name: postgres-ip
+                  value: "{{steps.create-postgres.ip}}"
+
+        - - name: recursive-run-study-optuna
+            template: recursive-run-study-optuna
+            continueOn:
+              failed: true
+            arguments:
+              parameters:
+                - name: postgres-ip
+                  value: "{{steps.create-postgres.ip}}"
+                - name: duration-mins
+                  value: "{{inputs.parameters.duration-mins}}"
+              artifacts:
+                - name: training-data
+                  from: "{{steps.download-training-data.outputs.artifacts.training-data}}"
+            withParam: "{{steps.generate-pod-list.outputs.result}}"
+
+        - - name: print-optuna-results
+            template: print-optuna-results
+            arguments:
+              parameters:
+                - name: postgres-ip
+                  value: "{{steps.create-postgres.ip}}"
+
+    - name: create-postgres
+      daemon: true
+      container:
+        image: postgres
+        resources:
+          limits:
+            cpu: 100m
+            memory: 1Gi
+        env:
+          - name: POSTGRES_USER
+            value: user
+          - name: POSTGRES_PASSWORD
+            value: pw
+        readinessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - exec pg_isready -h 127.0.0.1 -p 5432
+
+    - name: download-training-data
+      script:
+        image: python:3.8
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 500Mi
+        volumeMounts:
+          - name: workdir
+            mountPath: /home/output
+        command: [bash]
+        source: |
+          pip install scikit-learn
+          python -c '
+          import pickle
+          from sklearn.datasets import load_boston
+          boston = load_boston()
+          pickle.dump(boston.data, open("/home/output/data.pickle", "wb"))
+          '
+      outputs:
+        artifacts:
+          - name: training-data
+            path: /home/output/data.pickle
+
+    - name: generate-pod-list
+      inputs:
+        parameters:
+          - name: num-parallel-runs
+      script:
+        image: python:3.8
+        resources:
+          limits:
+            cpu: 10m
+            memory: 10Mi
+        command: [python]
+        source: |
+          import json
+          import sys
+          json.dump([i for i in range(0, {{inputs.parameters.num-parallel-runs}})], sys.stdout)
+
+    - name: generate-remaining-seconds
+      inputs:
+        parameters:
+          - name: duration-mins
+      script:
+        image: python:3.8
+        resources:
+          limits:
+            cpu: 10m
+            memory: 10Mi
+        command: [python]
+        source: |
+          from datetime import datetime, timedelta
+          format_str = "%Y-%m-%dT%H:%M:%SZ"
+          start_time_str = "{{workflow.creationTimestamp}}"
+          start_time = datetime.strptime(start_time_str, format_str)
+          stop_time = start_time + timedelta(minutes={{inputs.parameters.duration-mins}})
+          remaining_time_delta = stop_time - datetime.now()
+          print(int(remaining_time_delta.total_seconds()) )
+
+    - name: create-study-optuna
+      inputs:
+        parameters:
+          - name: postgres-ip
+      script:
+        image: optuna/optuna:py3.8
+        volumeMounts:
+          - name: workdir
+            mountPath: /home/output
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 500Mi
+        command: [bash]
+        source: |
+          pip install psycopg2-binary
+          python -c '
+          import optuna
+          optuna.create_study(study_name="example_study", storage="postgres://user:pw@{{inputs.parameters.postgres-ip}}:5432/postgres", direction="minimize")
+          '
+
+    - name: recursive-run-study-optuna
+      inputs:
+        parameters:
+          - name: postgres-ip
+          - name: duration-mins
+        artifacts:
+          - name: training-data
+      steps:
+        - - name: generate-remaining-seconds
+            template: generate-remaining-seconds
+            arguments:
+              parameters:
+                - name: duration-mins
+                  value: "{{inputs.parameters.duration-mins}}"
+
+        - - name: run-study-optuna
+            arguments:
+              parameters:
+                - name: postgres-ip
+                  value: "{{inputs.parameters.postgres-ip}}"
+                - name: remaining-seconds
+                  value: "{{steps.generate-remaining-seconds.outputs.result}}"
+              artifacts:
+                - name: training-data
+                  from: "{{inputs.artifacts.training-data}}"
+            template: run-study-optuna
+            continueOn:
+              failed: true
+            when: "{{steps.generate-remaining-seconds.outputs.result}} > 0"
+
+        - - name: loop
+            template: recursive-run-study-optuna
+            arguments:
+              parameters:
+                - name: postgres-ip
+                  value: "{{inputs.parameters.postgres-ip}}"
+                - name: duration-mins
+                  value: "{{inputs.parameters.duration-mins}}"
+              artifacts:
+                - name: training-data
+                  from: "{{inputs.artifacts.training-data}}"
+            when: "{{steps.generate-remaining-seconds.outputs.result}} > 0"
+
+    - name: run-study-optuna
+      inputs:
+        parameters:
+          - name: postgres-ip
+          - name: remaining-seconds
+        artifacts:
+          - name: training-data
+            path: /home/output/data.pickle
+      #podSpecPatch: '{"activeDeadlineSeconds":{{inputs.parameters.remaining-seconds}}}' -> to kill pods after total runtime is up
+      script:
+        image: optuna/optuna:py3.8
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        volumeMounts:
+          - name: workdir
+            mountPath: /home/output
+        command: [bash]
+        source: |
+          pip install psycopg2-binary xgboost
+          python -c '
+          import pickle
+          import numpy as np
+          import optuna
+          import xgboost as xgb
+
+          study = optuna.load_study(study_name="example_study", storage="postgres://user:pw@{{inputs.parameters.postgres-ip}}:5432/postgres")
+
+          data = pickle.load(open("/home/output/data.pickle", "rb"))
+          X, y = np.array(data[:,:-1]), np.array(data[:,-1])
+          dtrain = xgb.DMatrix(data=X,label=y)
+
+          def local_objective(trial):
+              eta = trial.suggest_loguniform("eta", 1e-3, 1e0)
+              max_depth = trial.suggest_int("max_depth", 1, 20)
+              params = {"objective":"reg:squarederror", "eta": eta, "max_depth": max_depth, "nthread": 1}
+              cv_results = xgb.cv(params, dtrain, nfold=5, num_boost_round=10)
+              return min(cv_results["test-rmse-mean"])
+
+          study.optimize(local_objective, n_trials=1)
+          '
+
+    - name: print-optuna-results
+      inputs:
+        parameters:
+          - name: postgres-ip
+      script:
+        image: optuna/optuna:py3.8
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 500Mi
+        command: [bash]
+        source: |
+          pip install psycopg2-binary pandas
+          python -c '
+          import optuna
+          study = optuna.load_study(study_name="example_study", storage="postgres://user:pw@{{inputs.parameters.postgres-ip}}:5432/postgres")
+          df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+          print("Best params: ", study.best_params)
+          print("Best value: ", study.best_value)
+          '
